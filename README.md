@@ -11,6 +11,9 @@
 *与你的专属派蒙实时语音对话，她会用原声回应你！*
 
 ### 📸 运行效果演示
+![AI派蒙界面截图](./assets/demo_screenshot.png)
+
+*动态演示：*
 ![AI派蒙交互演示](./assets/demo_recording.webp)
 
 </div>
