@@ -14,7 +14,7 @@
 ![AI派蒙界面截图](./assets/demo_screenshot.png)
 
 *动态演示：*
-![AI派蒙交互演示](./assets/demo_recording.webp)
+![AI派蒙交互演示](./assets/paimon_demo.webp)
 
 </div>
 
