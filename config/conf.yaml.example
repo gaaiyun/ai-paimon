@@ -1,0 +1,75 @@
+# ===========================
+# AI Paimon — Open-LLM-VTuber Configuration (Example)
+# ===========================
+# Copy this file into your Open-LLM-VTuber directory as `conf.yaml`
+# and replace all `YOUR_*` placeholders with your actual values.
+# ===========================
+
+system_config:
+  conf_version: 'v1.2.1'
+  host: 'localhost'
+  port: 12393
+  config_alts_dir: 'characters'
+  tool_prompts:
+    live2d_expression_prompt: 'live2d_expression_prompt'
+    group_conversation_prompt: 'group_conversation_prompt'
+    mcp_prompt: 'mcp_prompt'
+    proactive_speak_prompt: 'proactive_speak_prompt'
+
+character_config:
+  conf_name: 'paimon'
+  conf_uid: 'paimon_001'
+  live2d_model_name: 'paimon'
+  character_name: '派蒙'
+  avatar: 'paimon.jpg'
+  human_name: '旅行者'
+
+  persona_prompt: |
+    你是派蒙（Paimon），来自提瓦特大陆的神秘小精灵，是旅行者最忠实的向导和同伴。
+    你的性格活泼可爱、话很多、有点贪吃、偶尔犯迷糊，但关键时刻非常靠谱。
+    你说话时经常自称"派蒙"而不是"我"，喜欢用"欸嘿"、"哼"、"喂！"等语气词。
+    你对美食有着极大的热情，尤其喜欢甜甜花酿鸡和烤蘑菇披萨。
+    你会帮旅行者整理信息、提供建议，偶尔也会吐槽几句。
+    注意：用简短自然的口语风格说话，不要太书面化，回答要简洁。
+
+  agent_config:
+    conversation_agent_choice: 'basic_memory_agent'
+
+    agent_settings:
+      basic_memory_agent:
+        llm_provider: 'openai_compatible_llm'
+        faster_first_response: True
+        segment_method: 'pysbd'
+        use_mcpp: False
+
+    llm_configs:
+      openai_compatible_llm:
+        base_url: 'http://127.0.0.1:18789/v1'              # OpenClaw Gateway
+        llm_api_key: 'YOUR_OPENCLAW_GATEWAY_TOKEN'           # ← replace
+        organization_id: null
+        project_id: null
+        model: 'openclaw:main'
+        temperature: 0.7
+        interrupt_method: 'user'
+
+  asr_config:
+    asr_model: 'sherpa_onnx_asr'
+    sherpa_onnx_asr:
+      model_type: 'sense_voice'
+      sense_voice: './models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.int8.onnx'
+      tokens: './models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt'
+      num_threads: 4
+      use_itn: True
+      provider: 'cpu'
+
+  tts_config:
+    tts_model: 'x_tts'
+    x_tts:
+      api_url: 'http://127.0.0.1:8020/tts_to_audio'         # Paimon VITS server
+      speaker_wav: 'female'
+      language: 'zh'
+
+    # Fallback — uncomment to use Edge TTS instead of local VITS
+    # tts_model: 'edge_tts'
+    # edge_tts:
+    #   voice: zh-CN-XiaoxiaoNeural

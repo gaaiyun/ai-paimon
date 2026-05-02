@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment secrets
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.cursor/
+
+# Model weights (too large for git)
+*.pth
+*.onnx
+*.bin
+models/
+
+# Audio cache
+cache/
+*.wav
+*.mp3
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+logs/
+*.log
+
+# Compiled Cython
+VITS/monotonic_align/monotonic_align/*.c
+VITS/monotonic_align/monotonic_align/*.so
+VITS/monotonic_align/monotonic_align/*.pyd
