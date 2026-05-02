@@ -30,8 +30,13 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — ensure UTF-8 on Windows console
 # ---------------------------------------------------------------------------
+if sys.platform == "win32":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",

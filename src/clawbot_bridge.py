@@ -40,8 +40,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — ensure UTF-8 on Windows console
 # ---------------------------------------------------------------------------
+import sys as _sys
+if _sys.platform == "win32":
+    for _stream in (_sys.stdout, _sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",

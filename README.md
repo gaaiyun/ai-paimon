@@ -35,6 +35,10 @@ graph TD
         BROWSER["🌐 浏览器<br/>localhost:12393"]
     end
 
+    subgraph Core["⚙️ Open-LLM-VTuber<br/><i>核心编排器</i>"]
+        ORCH["Pipeline<br/>Orchestrator"]
+    end
+
     subgraph ASR["🗣️ 语音识别 (本地)"]
         SHERPA["sherpa-onnx<br/>SenseVoice<br/><i>CPU · 离线</i>"]
     end
@@ -53,15 +57,18 @@ graph TD
         AUDIO["音频播放"]
     end
 
-    MIC -->|音频流| SHERPA
-    SHERPA -->|文本| GATEWAY
-    GATEWAY -->|OpenAI API| CLAWBOT
-    CLAWBOT -->|AI 回复| GATEWAY
-    GATEWAY -->|文本| VITS
-    VITS -->|WAV 音频| BROWSER
+    MIC -->|音频流| BROWSER
+    BROWSER -->|WebSocket| ORCH
+    ORCH -->|音频| SHERPA
+    SHERPA -->|文本| ORCH
+    ORCH -->|OpenAI API| GATEWAY
+    GATEWAY <-->|WS| CLAWBOT
+    GATEWAY -->|AI 回复| ORCH
+    ORCH -->|文本| VITS
+    VITS -->|WAV 音频| ORCH
+    ORCH -->|音频+表情| BROWSER
     BROWSER --> LIVE2D
     BROWSER --> AUDIO
-    LIVE2D --> BROWSER
 ```
 
 ---
@@ -195,6 +202,7 @@ Then open **http://localhost:12393** in your browser 🎉
 | `VITS_MODEL_PATH` | Path to `paimon.pth` | `./paimon.pth` |
 | `VITS_CONFIG_PATH` | Path to VITS config JSON | auto-detected |
 | `VITS_PORT` | VITS server port | `8020` |
+| `OPEN_LLM_VTUBER_DIR` | Path to Open-LLM-VTuber installation | — |
 
 ### Persona Customization
 

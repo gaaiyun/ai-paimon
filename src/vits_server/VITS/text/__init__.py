@@ -1,6 +1,6 @@
 """ from https://github.com/keithito/tacotron """
-from VITS.text import cleaners
-from VITS.text.symbols import symbols, symbols_zh
+from . import cleaners
+from .symbols import symbols, symbols_zh
 
 
 # Mappings from symbol to numeric ID and vice versa:

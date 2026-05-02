@@ -50,7 +50,8 @@ def expand_abbreviations(text):
 
 
 def expand_numbers(text):
-  return normalize_numbers(text)
+  # normalize_numbers is not available in this fork; return text as-is
+  return text
 
 
 def lowercase(text):

@@ -10,6 +10,31 @@ echo.
 set "ROOT=%~dp0.."
 cd /d "%ROOT%"
 
+REM --- Load Open-LLM-VTuber path from .env or use default ---
+if exist "%ROOT%\.env" (
+    for /f "usebackq tokens=1,2 delims==" %%a in ("%ROOT%\.env") do (
+        if "%%a"=="OPEN_LLM_VTUBER_DIR" set "VTUBER_DIR=%%b"
+    )
+)
+if not defined VTUBER_DIR (
+    echo.
+    echo   ERROR: OPEN_LLM_VTUBER_DIR is not set.
+    echo   Please add the following line to your .env file:
+    echo     OPEN_LLM_VTUBER_DIR=C:\path\to\Open-LLM-VTuber
+    echo.
+    pause
+    exit /b 1
+)
+
+if not exist "%VTUBER_DIR%\run_server.py" (
+    echo.
+    echo   ERROR: Cannot find run_server.py in: %VTUBER_DIR%
+    echo   Please check your OPEN_LLM_VTUBER_DIR setting in .env
+    echo.
+    pause
+    exit /b 1
+)
+
 REM --- Step 1: Check OpenClaw Gateway ---
 echo [1/3] Checking ClawBot Gateway ...
 powershell -Command "try { $r = Invoke-WebRequest -Uri 'http://127.0.0.1:18789/' -TimeoutSec 3 -UseBasicParsing; Write-Host '  OK - Gateway is running' } catch { Write-Host '  WARNING: Gateway not running. Start it with: openclaw gateway'; pause; exit 1 }"
@@ -29,7 +54,7 @@ echo   Press Ctrl+C to stop
 echo ================================================
 echo.
 
-cd /d "%ROOT%\Open-LLM-VTuber"
+cd /d "%VTUBER_DIR%"
 uv run run_server.py
 
 pause
