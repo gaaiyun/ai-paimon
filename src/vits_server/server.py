@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import logging
 import os
 import sys
@@ -62,9 +63,43 @@ from VITS.text.symbols import symbols  # noqa: E402
 # ---------------------------------------------------------------------------
 load_dotenv()
 
-_DEFAULT_CONFIG = os.path.join(_THIS_DIR, "VITS", "configs", "biaobei_base.json")
+_PAIMON_CONFIG = os.path.join(_THIS_DIR, "..", "..", "models", "vits", "paimon", "paimon6k.json")
+_FALLBACK_CONFIG = os.path.join(_THIS_DIR, "VITS", "configs", "biaobei_base.json")
+_DEFAULT_CONFIG = _PAIMON_CONFIG if os.path.isfile(_PAIMON_CONFIG) else _FALLBACK_CONFIG
 CONFIG_PATH: str = os.getenv("VITS_CONFIG_PATH", _DEFAULT_CONFIG)
-MODEL_PATH: str = os.getenv("VITS_MODEL_PATH", os.path.join(_THIS_DIR, "..", "..", "paimon.pth"))
+_PAIMON_MODEL = os.path.join(_THIS_DIR, "..", "..", "models", "vits", "paimon", "paimon6k_390000.pth")
+_FALLBACK_MODEL = os.path.join(_THIS_DIR, "..", "..", "paimon.pth")
+_DEFAULT_MODEL = _PAIMON_MODEL if os.path.isfile(_PAIMON_MODEL) else _FALLBACK_MODEL
+MODEL_PATH: str = os.getenv("VITS_MODEL_PATH", _DEFAULT_MODEL)
+
+
+# ---------------------------------------------------------------------------
+# Detect symbols from config file (if present) and override module-level
+# ---------------------------------------------------------------------------
+def _load_config_symbols(config_path: str) -> list[str] | None:
+    """Read symbols list from a VITS JSON config, if the 'symbols' key exists."""
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if "symbols" in cfg:
+            return cfg["symbols"]
+    except Exception:
+        pass
+    return None
+
+
+config_symbols = _load_config_symbols(CONFIG_PATH)
+if config_symbols is not None:
+    # Monkey-patch the symbols list and rebuild the text module mappings
+    import VITS.text as _text_mod
+    _text_mod.symbols = config_symbols
+    _text_mod._symbol_to_id = {s: i for i, s in enumerate(config_symbols)}
+    _text_mod._id_to_symbol = {i: s for i, s in enumerate(config_symbols)}
+    n_symbols = len(config_symbols)
+    logger.info("  Symbols: %d (from config)", n_symbols)
+else:
+    n_symbols = len(symbols)
+    logger.info("  Symbols: %d (from symbols.py)", n_symbols)
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +128,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info("  Device : %s", device)
 
 net_g = SynthesizerTrn(
-    len(symbols),
+    n_symbols,
     hps.data.filter_length // 2 + 1,
     hps.train.segment_size // hps.data.hop_length,
     **hps.model,
