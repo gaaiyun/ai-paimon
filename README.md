@@ -132,10 +132,13 @@ ai-paimon/
 
 ### Prerequisites
 
-- **Python 3.10+** with `pip`
-- **[Open-LLM-VTuber](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber)** — cloned and set up
-- **[OpenClaw](https://openclaw.com/)** — installed with `openclaw gateway` available
-- **Paimon VITS model** — `paimon.pth` checkpoint file (~417 MB)
+| 依赖 | 说明 | 是否包含 |
+|------|------|---------|
+| Python 3.10+ | 基础运行环境 | 需自行安装 |
+| [Open-LLM-VTuber](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber) | VTuber 调度引擎 | 需自行克隆 |
+| [OpenClaw / ClawBot](https://openclaw.com/) | 本地 AI 网关 | 需自行安装 |
+| Paimon Live2D 模型 | 派蒙 2D 角色模型 | ✅ **已包含**（`live2d-models/paimon/`） |
+| `paimon.pth` VITS 权重 | 派蒙音色合成模型（~417MB） | ❌ **需自行下载**（见部署指南） |
 
 ### 1. Clone & Install
 
@@ -166,9 +169,19 @@ ai-paimon/
 ### 4. Configure Open-LLM-VTuber
 
 ```bash
+# 复制配置文件
 cp config/conf.yaml.example <your-open-llm-vtuber>/conf.yaml
-# Edit and verify the paths
+cp config/model_dict.json <your-open-llm-vtuber>/model_dict.json
+
+# 复制 Live2D 模型（已包含在本仓库）
+cp -r live2d-models/paimon <your-open-llm-vtuber>/live2d-models/paimon
+
+# 编辑 conf.yaml，填入你的 OpenClaw Token：
+# 打开 ~/.openclaw/openclaw.json，复制 "token" 字段的值
+# 粘贴到 conf.yaml 的 llm_api_key 字段
 ```
+
+> 📖 详见 [完整部署指南](./docs/setup-guide.md) — 包含每一步的截图和排错说明。
 
 ### 5. Launch
 
