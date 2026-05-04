@@ -24,8 +24,8 @@ env/
 *.swo
 .cursor/
 
-# Model weights (too large for git)
-*.pth
+# Model weights — tracked via Git LFS (see .gitattributes)
+# *.pth is now managed by LFS, do NOT add it here
 *.onnx
 *.bin
 models/
