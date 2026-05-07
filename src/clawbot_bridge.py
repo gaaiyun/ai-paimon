@@ -1,10 +1,9 @@
 """
 ClawBot (OpenClaw) WebSocket → OpenAI-Compatible API Bridge
 
-Bridges the OpenClaw Gateway's WebSocket protocol (including Ed25519
-challenge-response authentication) to a standard OpenAI
-``/v1/chat/completions`` HTTP endpoint so that any OpenAI-compatible
-client (e.g. Open-LLM-VTuber) can talk to ClawBot seamlessly.
+Bridges the OpenClaw Gateway's WebSocket protocol v3 (including Ed25519
+device authentication) to a standard OpenAI ``/v1/chat/completions``
+HTTP endpoint so that any OpenAI-compatible client can talk to ClawBot.
 
 Configuration
 -------------
@@ -34,15 +33,20 @@ from typing import Any
 import uvicorn
 import websockets
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    PublicFormat,
+    load_pem_private_key,
+)
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
-# Logging — ensure UTF-8 on Windows console
+# Logging
 # ---------------------------------------------------------------------------
 import sys as _sys
+
 if _sys.platform == "win32":
     for _stream in (_sys.stdout, _sys.stderr):
         if hasattr(_stream, "reconfigure"):
@@ -56,7 +60,7 @@ logging.basicConfig(
 logger = logging.getLogger("clawbot_bridge")
 
 # ---------------------------------------------------------------------------
-# Configuration — loaded from environment / .env file
+# Configuration
 # ---------------------------------------------------------------------------
 load_dotenv()
 
@@ -70,18 +74,69 @@ OPENCLAW_PRIVATE_KEY: str = os.getenv(
     "-----BEGIN PRIVATE KEY-----\nREPLACE_ME\n-----END PRIVATE KEY-----\n",
 )
 
+SCOPES = [
+    "operator.admin",
+    "operator.write",
+    "operator.read",
+    "operator.approvals",
+    "operator.pairing",
+    "operator.talk.secrets",
+]
+
 
 # ---------------------------------------------------------------------------
-# Crypto helpers
+# Crypto helpers (OpenClaw v3 protocol)
 # ---------------------------------------------------------------------------
 
-def _sign_nonce(nonce: str) -> str:
-    """Sign *nonce* with the Ed25519 private key and return a base64url signature."""
+def _b64url_encode(data: bytes) -> str:
+    """Base64url encode without padding."""
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _get_raw_public_key_b64url(pem: str) -> str:
+    """Extract raw Ed25519 public key bytes and return base64url encoded."""
     private_key: Ed25519PrivateKey = load_pem_private_key(
-        OPENCLAW_PRIVATE_KEY.encode(), password=None
-    )  # type: ignore[assignment]
-    signature = private_key.sign(nonce.encode("utf-8"))
-    return base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+        pem.encode(), password=None
+    )
+    raw = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    return _b64url_encode(raw)
+
+
+def _build_auth_payload_v3(
+    *,
+    device_id: str,
+    client_id: str,
+    client_mode: str,
+    role: str,
+    scopes: list[str],
+    signed_at_ms: int,
+    token: str,
+    nonce: str,
+    platform: str,
+) -> str:
+    """Build the v3 pipe-delimited payload for device signing."""
+    return "|".join([
+        "v3",
+        device_id,
+        client_id,
+        client_mode,
+        role,
+        ",".join(scopes),
+        str(signed_at_ms),
+        token or "",
+        nonce,
+        (platform or "").strip().lower(),
+        "",  # deviceFamily (empty)
+    ])
+
+
+def _sign_payload(pem: str, payload: str) -> str:
+    """Sign the payload string with Ed25519 private key, return base64url."""
+    private_key: Ed25519PrivateKey = load_pem_private_key(
+        pem.encode(), password=None
+    )
+    sig = private_key.sign(payload.encode("utf-8"))
+    return _b64url_encode(sig)
 
 
 # ---------------------------------------------------------------------------
@@ -101,178 +156,254 @@ class OpenClawBridge:
     async def connect(self) -> None:
         """Connect (if not already) and authenticate with the gateway."""
         async with self._lock:
-            if self._connected and self.ws and self.ws.open:
-                return
+            if self._connected and self.ws:
+                try:
+                    if not getattr(self.ws, "closed", False):
+                        return
+                except Exception:
+                    pass
             await self._do_connect()
 
     async def _do_connect(self) -> None:
-        """Perform the full connect → challenge → solve handshake."""
+        """Perform the full connect → challenge → connect handshake."""
         logger.info("Connecting to OpenClaw Gateway: %s", OPENCLAW_WS_URL)
-        self.ws = await websockets.connect(OPENCLAW_WS_URL)
+        self.ws = await websockets.connect(
+            OPENCLAW_WS_URL,
+            ping_interval=None,
+            ping_timeout=None,
+        )
 
-        # Step 1: send ``connect`` request
-        connect_id = str(uuid.uuid4())
+        # Step 1: receive challenge event with nonce
+        raw = await asyncio.wait_for(self.ws.recv(), timeout=10)
+        msg: dict[str, Any] = json.loads(raw)
+
+        if msg.get("event") != "connect.challenge":
+            raise ConnectionError(f"Expected connect.challenge, got: {msg}")
+
+        nonce = msg["payload"]["nonce"]
+        logger.info("  Challenge nonce: %s…", nonce[:20])
+
+        # Step 2: build v3 device auth payload and sign it
+        signed_at_ms = int(time.time() * 1000)
+        public_key_b64url = _get_raw_public_key_b64url(OPENCLAW_PRIVATE_KEY)
+
+        payload_str = _build_auth_payload_v3(
+            device_id=OPENCLAW_DEVICE_ID,
+            client_id="cli",
+            client_mode="cli",
+            role="operator",
+            scopes=SCOPES,
+            signed_at_ms=signed_at_ms,
+            token=OPENCLAW_TOKEN,
+            nonce=nonce,
+            platform="win32",
+        )
+        signature = _sign_payload(OPENCLAW_PRIVATE_KEY, payload_str)
+
+        # Step 3: send connect request with device identity
         connect_req = {
             "type": "req",
-            "id": connect_id,
+            "id": str(uuid.uuid4()),
             "method": "connect",
             "params": {
-                "auth": {"token": OPENCLAW_TOKEN},
+                "minProtocol": 3,
+                "maxProtocol": 3,
                 "client": {
                     "id": "cli",
                     "mode": "cli",
                     "version": "1.0.0",
                     "platform": "win32",
                 },
-                "maxProtocol": 1,
+                "auth": {
+                    "token": OPENCLAW_TOKEN,
+                    "deviceToken": OPENCLAW_DEVICE_TOKEN,
+                },
                 "role": "operator",
-                "scopes": ["operator.admin"],
+                "scopes": SCOPES,
+                "device": {
+                    "id": OPENCLAW_DEVICE_ID,
+                    "publicKey": public_key_b64url,
+                    "signature": signature,
+                    "signedAt": signed_at_ms,
+                    "nonce": nonce,
+                },
             },
         }
         await self.ws.send(json.dumps(connect_req))
+        logger.info("  Sent connect with device identity")
 
-        # Step 2: handle challenge
-        raw = await asyncio.wait_for(self.ws.recv(), timeout=10)
-        msg: dict[str, Any] = json.loads(raw)
-        logger.info(
-            "  Received: type=%s, method=%s",
-            msg.get("type"),
-            msg.get("method", msg.get("event", "")),
-        )
-
-        if msg.get("type") == "event" and "challenge" in str(msg.get("event", "")):
-            payload = msg.get("payload", msg.get("data", msg.get("params", {})))
-            nonce = payload.get("nonce", "")
-            logger.info("  Challenge nonce received: %s…", nonce[:20])
-
-            signature = _sign_nonce(nonce)
-            signed_at = int(time.time() * 1000)
-
-            solve_req = {
-                "type": "req",
-                "id": str(uuid.uuid4()),
-                "method": "connect.solve",
-                "params": {
-                    "deviceId": OPENCLAW_DEVICE_ID,
-                    "signature": signature,
-                    "signedAt": signed_at,
-                },
-            }
-            await self.ws.send(json.dumps(solve_req))
-
-            raw2 = await asyncio.wait_for(self.ws.recv(), timeout=10)
-            msg2: dict[str, Any] = json.loads(raw2)
-            logger.info("  Solve response: type=%s, error=%s", msg2.get("type"), msg2.get("error"))
-
-            if msg2.get("type") == "res" and msg2.get("error") is None:
-                logger.info("✅ Authentication successful!")
-                self._connected = True
-                return
-
-            # There may be extra messages in the queue
+        # Step 4: read responses until we get hello-ok or error
+        for _ in range(10):
             try:
-                raw3 = await asyncio.wait_for(self.ws.recv(), timeout=5)
-                msg3: dict[str, Any] = json.loads(raw3)
-                if msg3.get("type") == "res" and msg3.get("error") is None:
-                    logger.info("✅ Authentication successful!")
-                    self._connected = True
-                    return
+                raw = await asyncio.wait_for(self.ws.recv(), timeout=10)
             except asyncio.TimeoutError:
-                pass
+                raise ConnectionError("Timeout waiting for connect response")
 
-            raise ConnectionError(f"Authentication failed: {msg2}")
+            resp: dict[str, Any] = json.loads(raw)
 
-        elif msg.get("type") == "res" and msg.get("error") is None:
-            logger.info("✅ Direct authentication successful!")
-            self._connected = True
-        else:
-            raise ConnectionError(f"Unexpected auth response: {msg}")
+            if resp.get("type") == "res":
+                if resp.get("ok"):
+                    payload = resp.get("payload", {})
+                    if isinstance(payload, dict) and payload.get("type") == "hello-ok":
+                        granted = payload.get("auth", {}).get("scopes", [])
+                        logger.info(
+                            "✅ Authentication successful! Granted scopes: %s",
+                            granted,
+                        )
+                        self._connected = True
+                        return
+                    # Some other ok response — keep reading
+                    logger.info("  Got ok response: %s", json.dumps(resp, ensure_ascii=False)[:300])
+                else:
+                    err = resp.get("error", {})
+                    raise ConnectionError(
+                        f"Authentication failed: {err}"
+                    )
+            elif resp.get("type") == "event":
+                # Drain events (health, etc.) while waiting for hello-ok
+                logger.debug("  Draining event: %s", resp.get("event", ""))
 
-    # -- chat ---------------------------------------------------------------
+        raise ConnectionError("Never received hello-ok")
+
+    # -- channel / talk -----------------------------------------------------
+
+    async def _ensure_session(self) -> str:
+        """Create a session and subscribe to its events. Returns the session key."""
+        assert self.ws is not None
+        sid = str(uuid.uuid4())
+        await self.ws.send(json.dumps({
+            "type": "req",
+            "id": sid,
+            "method": "sessions.create",
+            "params": {},
+        }))
+
+        session_key = ""
+        for _ in range(10):
+            raw = await asyncio.wait_for(self.ws.recv(), timeout=10)
+            msg: dict[str, Any] = json.loads(raw)
+            if msg.get("id") == sid and msg.get("ok"):
+                pd = msg.get("payload", {})
+                session_key = pd.get("key", "")
+                break
+
+        if not session_key:
+            raise ConnectionError("Failed to create session")
+
+        # Subscribe to session events to receive assistant replies
+        sub_id = str(uuid.uuid4())
+        await self.ws.send(json.dumps({
+            "type": "req",
+            "id": sub_id,
+            "method": "sessions.subscribe",
+            "params": {"key": session_key},
+        }))
+
+        for _ in range(5):
+            raw = await asyncio.wait_for(self.ws.recv(), timeout=5)
+            msg = json.loads(raw)
+            if msg.get("id") == sub_id:
+                break
+
+        logger.info("  Session created: %s", session_key)
+        return session_key
 
     async def send_chat(self, message: str, timeout: float = 120) -> str:
         """Send a chat message and collect the assistant reply."""
-        await self.connect()
-        assert self.ws is not None
+        async with self._lock:
+            if not self._connected or not self.ws or getattr(self.ws, "closed", False):
+                await self._do_connect()
 
-        req_id = str(uuid.uuid4())
-        chat_req = {
-            "type": "req",
-            "id": req_id,
-            "method": "chat.send",
-            "params": {
-                "sessionKey": OPENCLAW_SESSION,
-                "message": message,
-            },
-        }
-        await self.ws.send(json.dumps(chat_req))
-        logger.info("📤 Sent: %s…", message[:50])
+            session_key = await self._ensure_session()
+            assert self.ws is not None
 
-        reply_parts: list[str] = []
-        deadline = time.time() + timeout
+            req_id = str(uuid.uuid4())
+            await self.ws.send(json.dumps({
+                "type": "req",
+                "id": req_id,
+                "method": "sessions.send",
+                "params": {
+                    "key": session_key,
+                    "message": message,
+                },
+            }))
+            logger.info("📤 Sent msg_id=%s via session %s", req_id, session_key[:30])
 
-        while time.time() < deadline:
-            try:
-                remaining = max(0.1, deadline - time.time())
-                raw = await asyncio.wait_for(
-                    self.ws.recv(), timeout=min(remaining, 30)
-                )
-                msg: dict[str, Any] = json.loads(raw)
-            except asyncio.TimeoutError:
-                if reply_parts:
-                    break
-                continue
-            except websockets.ConnectionClosed:
-                self._connected = False
-                break
+            # Collect assistant text from session events
+            assistant_texts: list[str] = []
+            deadline = time.time() + timeout
 
-            msg_type = msg.get("type", "")
-            msg_method = msg.get("method", msg.get("event", ""))
-            msg_id = msg.get("id", "")
-
-            # Direct response to our chat.send request
-            if msg_type == "res" and msg_id == req_id:
-                result = msg.get("result", {})
-                if isinstance(result, dict):
-                    text = result.get("text", result.get("content", result.get("message", "")))
-                    if text:
-                        reply_parts.append(str(text))
+            while time.time() < deadline:
+                try:
+                    remaining = max(0.1, deadline - time.time())
+                    raw = await asyncio.wait_for(
+                        self.ws.recv(), timeout=min(remaining, 30)
+                    )
+                    msg: dict[str, Any] = json.loads(raw)
+                except asyncio.TimeoutError:
+                    if assistant_texts:
                         break
-                continue
+                    continue
+                except websockets.ConnectionClosed:
+                    self._connected = False
+                    break
 
-            # Chat-related events
-            if msg_type == "event":
-                data = msg.get("data", msg.get("payload", msg.get("params", {})))
+                msg_type = msg.get("type", "")
+                msg_id = msg.get("id", "")
+                event = msg.get("event", "")
 
-                if "chat" in str(msg_method):
-                    if isinstance(data, dict):
-                        text = (
-                            data.get("text", "")
-                            or data.get("content", "")
-                            or data.get("message", "")
-                        )
-                        role = data.get("role", data.get("from", ""))
-                        if text and role != "user":
-                            reply_parts.append(str(text))
-                        if data.get("done") or data.get("finished") or data.get("complete"):
+                # Direct response to our send request
+                if msg_type == "res" and msg_id == req_id:
+                    if msg.get("ok") is False:
+                        err = msg.get("error", {})
+                        err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                        logger.error("  sessions.send error: %s", err_msg)
+                        raise RuntimeError(f"sessions.send failed: {err_msg}")
+                    continue
+
+                # Session events carry the AI's reply
+                if msg_type == "event":
+                    payload = msg.get("payload", msg.get("data", {}))
+                    if not isinstance(payload, dict):
+                        continue
+
+                    # agent stream events carry the assistant text
+                    if event == "agent":
+                        stream = payload.get("stream", "")
+                        data = payload.get("data", {})
+                        if stream == "assistant" and isinstance(data, dict):
+                            text = data.get("text", "")
+                            if text:
+                                # If replace=True, overwrite last entry
+                                if data.get("replace") and assistant_texts:
+                                    assistant_texts[-1] = text
+                                else:
+                                    assistant_texts.append(text)
+                        elif stream == "lifecycle" and isinstance(data, dict):
+                            if data.get("phase") == "end":
+                                break
+
+                    # chat events with final state contain the complete reply
+                    elif event == "chat":
+                        state = payload.get("state", "")
+                        chat_msg = payload.get("message", {})
+                        if isinstance(chat_msg, dict) and chat_msg.get("role") == "assistant":
+                            content = chat_msg.get("content", "")
+                            if isinstance(content, list):
+                                for item in content:
+                                    if isinstance(item, dict) and item.get("type") == "text":
+                                        assistant_texts.append(item.get("text", ""))
+                            elif isinstance(content, str) and content:
+                                assistant_texts.append(content)
+                        if state == "final":
                             break
-                    elif isinstance(data, str) and data:
-                        reply_parts.append(data)
 
-                if "agent" in str(msg_method) and any(
-                    kw in str(msg_method) for kw in ("done", "stop", "complete")
-                ):
-                    if reply_parts:
-                        break
-
-                if "session" in str(msg_method) and "end" in str(msg_method):
-                    break
-
-        reply = "".join(reply_parts).strip()
-        if not reply:
-            reply = "（ClawBot did not return a valid reply — check Gateway status and Agent config）"
-        logger.info("📥 Reply: %s…", reply[:80])
-        return reply
+            # Take the last assistant text (the final reply)
+            reply = assistant_texts[-1].strip() if assistant_texts else ""
+            if not reply:
+                reply = "（ClawBot did not return a valid reply — check Gateway status and Agent config）"
+            logger.info("📥 Reply: %s…", reply[:80])
+            return reply
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -310,12 +441,29 @@ app = FastAPI(
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> JSONResponse:
-    """OpenAI-compatible Chat Completions endpoint."""
+    """OpenAI-compatible Chat Completions endpoint.
+
+    Extracts conversation history and the latest user message, formats them
+    into a single structured message for OpenClaw's ``sessions.send``.
+
+    System prompt is intentionally NOT injected here — OpenClaw manages
+    persona through its workspace files (IDENTITY.md / SOUL.md), and the
+    VTuber persona_prompt is already conveyed via conversation context.
+    """
     body = await request.json()
     messages = body.get("messages", [])
 
+    conversation_history = [
+        msg for msg in messages
+        if msg.get("role") in ("user", "assistant")
+    ]
+
+    # Truncate to last 10 messages to avoid token overflow
+    if len(conversation_history) > 10:
+        conversation_history = conversation_history[-10:]
+
     user_msg = ""
-    for msg in reversed(messages):
+    for msg in reversed(conversation_history):
         if msg.get("role") == "user":
             user_msg = msg.get("content", "")
             break
@@ -326,8 +474,18 @@ async def chat_completions(request: Request) -> JSONResponse:
             content={"error": {"message": "No user message found", "type": "invalid_request"}},
         )
 
+    # Build structured message with conversation context + current input
+    full_message = ""
+    if len(conversation_history) > 1:
+        full_message += "[对话历史]\n"
+        for msg in conversation_history[:-1]:
+            role_label = "用户" if msg.get("role") == "user" else "派蒙"
+            full_message += f"{role_label}：{msg.get('content', '')}\n"
+        full_message += "\n"
+    full_message += f"[当前输入]\n用户：{user_msg}"
+
     try:
-        reply = await bridge.send_chat(user_msg)
+        reply = await bridge.send_chat(full_message)
     except Exception as exc:
         logger.error("Communication error: %s", exc)
         return JSONResponse(
@@ -349,9 +507,9 @@ async def chat_completions(request: Request) -> JSONResponse:
                 }
             ],
             "usage": {
-                "prompt_tokens": len(user_msg),
+                "prompt_tokens": len(full_message),
                 "completion_tokens": len(reply),
-                "total_tokens": len(user_msg) + len(reply),
+                "total_tokens": len(full_message) + len(reply),
             },
         }
     )
