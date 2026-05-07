@@ -299,6 +299,31 @@ uv run run_server.py
 
 ---
 
+## 可选：使用 PaimonPet 桌面宠物
+
+除了浏览器界面，你还可以使用 [PaimonPet 桌面版](https://github.com/gaaiyun/paimon-pet)，获得更好的桌面体验：
+
+- 透明置顶窗口，派蒙常驻桌面
+- 精灵图动画（闲置/倾听/思考/说话/拖拽）
+- 点击派蒙打开聊天面板，支持语音和文字
+- 系统托盘菜单
+- 一键启动后端服务
+
+### 安装 PaimonPet
+
+```powershell
+# 在 ai-paimon 同级目录下克隆
+cd ..  # 回到 paimon pet/ 目录
+git clone https://github.com/gaaiyun/paimon-pet.git
+cd paimon-pet
+npm install
+npx tauri dev
+```
+
+> PaimonPet 会自动检测同级目录下的 `ai-paimon` 和 `Open-LLM-VTuber` 路径。
+
+---
+
 ## 常见问题排查
 
 ### ❓ 出现 `401 Unauthorized` 错误
@@ -355,4 +380,4 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 ---
 
-*最后更新: 2026-05-04*
+*最后更新: 2026-05-07*

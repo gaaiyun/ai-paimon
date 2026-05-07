@@ -59,12 +59,14 @@ graph TD
     end
 
     subgraph Frontend["🎭 前端"]
-        LIVE2D["Live2D 派蒙模型"]
+        LIVE2D["Live2D 派蒙模型<br/><i>浏览器版</i>"]
+        DESKTOP["PaimonPet 桌面宠物<br/><i>Tauri · 精灵图动画</i>"]
         AUDIO["音频播放"]
     end
 
     MIC -->|音频流| BROWSER
     BROWSER -->|WebSocket| ORCH
+    DESKTOP -->|WebSocket| ORCH
     ORCH -->|音频| SHERPA
     SHERPA -->|文本| ORCH
     ORCH -->|OpenAI API| GATEWAY
@@ -197,13 +199,22 @@ cd <your-open-llm-vtuber>
 uv run run_server.py
 ```
 
-Or use the one-click launcher (Windows):
+Then open **http://localhost:12393** in your browser 🎉
 
-```batch
-scripts\start_all.bat
+Or use the [**PaimonPet 桌面版**](https://github.com/gaaiyun/paimon-pet) — 透明窗口桌面宠物，支持精灵图动画、语音/文字聊天、一键启动服务。
+
+### 6. Desktop Pet (Optional)
+
+For a native desktop experience with sprite animation and always-on-top transparent window:
+
+```bash
+git clone https://github.com/gaaiyun/paimon-pet.git
+cd paimon-pet
+npm install
+npx tauri dev
 ```
 
-Then open **http://localhost:12393** in your browser 🎉
+See [PaimonPet README](https://github.com/gaaiyun/paimon-pet) for details.
 
 ---
 
