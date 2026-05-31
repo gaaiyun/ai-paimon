@@ -1,1 +1,16 @@
+# ---------------------------------------------------------------------------
+# Git LFS tracking
+# ---------------------------------------------------------------------------
+# NOTE: LFS tracking applies to FUTURE commits only. Existing blobs already in
+# history are NOT migrated (we intentionally do not rewrite history). Run
+# `git lfs migrate` separately if you ever need to relocate historical blobs.
+
+# VITS model weights (~417 MB)
 *.pth filter=lfs diff=lfs merge=lfs -text
+
+# Live2D model assets derived from Genshin Impact (miHoYo / HoYoverse).
+# Personal, non-commercial use only — please do not redistribute. See README.
+*.moc3        filter=lfs diff=lfs merge=lfs -text
+*.pkf         filter=lfs diff=lfs merge=lfs -text
+*.motion3.json filter=lfs diff=lfs merge=lfs -text
+live2d-models/**/*.png filter=lfs diff=lfs merge=lfs -text

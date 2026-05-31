@@ -44,11 +44,11 @@ character_config:
 
     llm_configs:
       openai_compatible_llm:
-        base_url: 'http://127.0.0.1:18789/v1'              # OpenClaw Gateway
-        llm_api_key: 'YOUR_OPENCLAW_GATEWAY_TOKEN'           # ← replace
+        base_url: 'http://127.0.0.1:5001/v1'               # ClawBot Bridge (本仓库 src/clawbot_bridge.py)
+        llm_api_key: 'not-needed'                            # 桥接器不校验此值，但必须非空；真正的 OpenClaw 凭据放在 .env
         organization_id: null
         project_id: null
-        model: 'openclaw:main'
+        model: 'clawbot'
         temperature: 0.7
         interrupt_method: 'user'
 
