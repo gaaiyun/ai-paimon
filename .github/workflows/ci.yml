@@ -1,0 +1,53 @@
+name: CI
+
+# Offline CI: lint + import check + tests. No secrets, no network calls, no
+# OpenClaw Gateway, no model weights. Everything is mocked.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - name: Checkout (no LFS — CI does not need model weights)
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dev dependencies (no torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Import check — bridge must import with no Gateway / no secrets
+        run: |
+          python -c "import sys; sys.path.insert(0, 'src'); import clawbot_bridge; print('bridge import OK')"
+
+      - name: Compile check — VITS server (torch not installed in CI)
+        run: |
+          python -m py_compile src/vits_server/server.py
+          echo "vits_server compiles OK"
+
+      - name: Run tests (offline, mocked websocket)
+        run: pytest

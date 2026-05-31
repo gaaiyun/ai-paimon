@@ -8,6 +8,8 @@ __pycache__/
 dist/
 build/
 *.egg
+.pytest_cache/
+.ruff_cache/
 
 # Virtual environments
 .venv/
