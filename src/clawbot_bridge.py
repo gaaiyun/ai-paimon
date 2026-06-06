@@ -5,6 +5,24 @@ Bridges the OpenClaw Gateway's WebSocket protocol v3 (including Ed25519
 device authentication) to a standard OpenAI ``/v1/chat/completions``
 HTTP endpoint so that any OpenAI-compatible client can talk to ClawBot.
 
+This bridge is the canonical OpenClaw → OpenAI entry point: Open-LLM-VTuber
+points its ``base_url`` at this service (default ``http://127.0.0.1:5001/v1``),
+and the bridge owns the single WebSocket connection to the Gateway.
+
+Design
+------
+* **One connection, one receive loop.** A single background task reads every
+  frame from the Gateway and dispatches it: responses go to the pending
+  request that owns the matching ``id``; session events go to per-session
+  queues. No two coroutines ever call ``recv()`` concurrently, so frames are
+  never lost or stolen between requests.
+* **Sessions are reused.** A conversation maps to a single OpenClaw session
+  (cached by ``conversation_id``), so the agent keeps its shared memory across
+  turns instead of getting a fresh session every message.
+* **Per-session locking.** Requests on the *same* conversation serialise (they
+  share message ordering); requests on *different* conversations run
+  concurrently.
+
 Configuration
 -------------
 All secrets are loaded from environment variables.  Copy ``.env.example``
@@ -12,7 +30,7 @@ to ``.env`` and fill in your values, or export them in your shell.
 
 Usage::
 
-    pip install fastapi uvicorn websockets cryptography python-dotenv
+    pip install fastapi uvicorn websockets cryptography python-dotenv pydantic
     python src/clawbot_bridge.py            # defaults to port 5001
     python src/clawbot_bridge.py --port 6000
 """
@@ -25,6 +43,7 @@ import base64
 import json
 import logging
 import os
+import sys as _sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -39,14 +58,13 @@ from cryptography.hazmat.primitives.serialization import (
     load_pem_private_key,
 )
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-import sys as _sys
-
 if _sys.platform == "win32":
     for _stream in (_sys.stdout, _sys.stderr):
         if hasattr(_stream, "reconfigure"):
@@ -82,6 +100,53 @@ SCOPES = [
     "operator.pairing",
     "operator.talk.secrets",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Pydantic request models (reject malformed input)
+# ---------------------------------------------------------------------------
+
+class ChatMessage(BaseModel):
+    """A single OpenAI chat message."""
+
+    role: str
+    content: Any = ""
+
+    @field_validator("content")
+    @classmethod
+    def _stringify_content(cls, v: Any) -> str:
+        """Normalise content into a plain string.
+
+        OpenAI clients may send a string or a list of content parts
+        (``[{"type": "text", "text": "..."}]``); accept both.
+        """
+        if isinstance(v, str):
+            return v
+        if isinstance(v, list):
+            parts: list[str] = []
+            for item in v:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "".join(parts)
+        if v is None:
+            return ""
+        return str(v)
+
+
+class ChatCompletionRequest(BaseModel):
+    """Subset of the OpenAI Chat Completions request we accept."""
+
+    messages: list[ChatMessage] = Field(..., min_length=1)
+    model: str = "clawbot"
+    # ``user`` (OpenAI standard) doubles as our conversation/session key so
+    # one conversation reuses one OpenClaw session and keeps shared memory.
+    user: str | None = None
+    stream: bool = False
+    temperature: float | None = None
+
+    model_config = {"extra": "ignore"}
 
 
 # ---------------------------------------------------------------------------
@@ -144,28 +209,51 @@ def _sign_payload(pem: str, payload: str) -> str:
 # ---------------------------------------------------------------------------
 
 class OpenClawBridge:
-    """Maintains a persistent WebSocket connection to the OpenClaw Gateway."""
+    """Persistent WebSocket connection to the OpenClaw Gateway.
+
+    A single background task (:meth:`_receive_loop`) owns the socket reads and
+    fans frames out to per-request futures and per-session event queues, so
+    concurrent HTTP requests never compete for ``recv()``.
+    """
 
     def __init__(self) -> None:
         self.ws: websockets.WebSocketClientProtocol | None = None
         self._connected: bool = False
-        self._lock = asyncio.Lock()
+        # Serialises connect/reconnect only — NOT individual chat requests.
+        self._conn_lock = asyncio.Lock()
+        self._recv_task: asyncio.Task | None = None
+
+        # req_id -> Future resolved with the matching ``res`` frame.
+        self._pending: dict[str, asyncio.Future] = {}
+        # session_key -> queue of event frames belonging to that session.
+        self._session_events: dict[str, asyncio.Queue] = {}
+
+        # conversation_id -> session_key  (enables session reuse / memory).
+        self._sessions: dict[str, str] = {}
+        # conversation_id -> lock  (serialise turns within one conversation).
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     # -- connection / auth --------------------------------------------------
 
+    def _is_open(self) -> bool:
+        return bool(self._connected and self.ws and not getattr(self.ws, "closed", False))
+
     async def connect(self) -> None:
         """Connect (if not already) and authenticate with the gateway."""
-        async with self._lock:
-            if self._connected and self.ws:
-                try:
-                    if not getattr(self.ws, "closed", False):
-                        return
-                except Exception:
-                    pass
+        async with self._conn_lock:
+            if self._is_open():
+                return
             await self._do_connect()
 
     async def _do_connect(self) -> None:
-        """Perform the full connect → challenge → connect handshake."""
+        """Perform the full connect → challenge → connect handshake.
+
+        Caller must hold ``self._conn_lock``.
+        """
+        # Tear down any previous receive loop / cached session state — a new
+        # socket means old session keys are no longer valid.
+        await self._teardown_locked()
+
         logger.info("Connecting to OpenClaw Gateway: %s", OPENCLAW_WS_URL)
         self.ws = await websockets.connect(
             OPENCLAW_WS_URL,
@@ -232,12 +320,13 @@ class OpenClawBridge:
         await self.ws.send(json.dumps(connect_req))
         logger.info("  Sent connect with device identity")
 
-        # Step 4: read responses until we get hello-ok or error
+        # Step 4: read responses until we get hello-ok or error.  This runs
+        # before the background receive loop starts, so reading here is safe.
         for _ in range(10):
             try:
                 raw = await asyncio.wait_for(self.ws.recv(), timeout=10)
-            except asyncio.TimeoutError:
-                raise ConnectionError("Timeout waiting for connect response")
+            except asyncio.TimeoutError as exc:
+                raise ConnectionError("Timeout waiting for connect response") from exc
 
             resp: dict[str, Any] = json.loads(raw)
 
@@ -247,171 +336,269 @@ class OpenClawBridge:
                     if isinstance(payload, dict) and payload.get("type") == "hello-ok":
                         granted = payload.get("auth", {}).get("scopes", [])
                         logger.info(
-                            "✅ Authentication successful! Granted scopes: %s",
+                            "[OK] Authentication successful. Granted scopes: %s",
                             granted,
                         )
                         self._connected = True
+                        # Start the single background receive loop.
+                        self._recv_task = asyncio.create_task(self._receive_loop())
                         return
                     # Some other ok response — keep reading
-                    logger.info("  Got ok response: %s", json.dumps(resp, ensure_ascii=False)[:300])
+                    logger.info(
+                        "  Got ok response: %s",
+                        json.dumps(resp, ensure_ascii=False)[:300],
+                    )
                 else:
                     err = resp.get("error", {})
-                    raise ConnectionError(
-                        f"Authentication failed: {err}"
-                    )
+                    raise ConnectionError(f"Authentication failed: {err}")
             elif resp.get("type") == "event":
                 # Drain events (health, etc.) while waiting for hello-ok
                 logger.debug("  Draining event: %s", resp.get("event", ""))
 
         raise ConnectionError("Never received hello-ok")
 
-    # -- channel / talk -----------------------------------------------------
+    # -- receive loop -------------------------------------------------------
 
-    async def _ensure_session(self) -> str:
-        """Create a session and subscribe to its events. Returns the session key."""
-        assert self.ws is not None
-        sid = str(uuid.uuid4())
-        await self.ws.send(json.dumps({
-            "type": "req",
-            "id": sid,
-            "method": "sessions.create",
-            "params": {},
-        }))
+    async def _receive_loop(self) -> None:
+        """Single owner of ``ws.recv()``; fan frames out to waiters.
 
-        session_key = ""
-        for _ in range(10):
-            raw = await asyncio.wait_for(self.ws.recv(), timeout=10)
-            msg: dict[str, Any] = json.loads(raw)
-            if msg.get("id") == sid and msg.get("ok"):
-                pd = msg.get("payload", {})
-                session_key = pd.get("key", "")
-                break
-
-        if not session_key:
-            raise ConnectionError("Failed to create session")
-
-        # Subscribe to session events to receive assistant replies
-        sub_id = str(uuid.uuid4())
-        await self.ws.send(json.dumps({
-            "type": "req",
-            "id": sub_id,
-            "method": "sessions.subscribe",
-            "params": {"key": session_key},
-        }))
-
-        for _ in range(5):
-            raw = await asyncio.wait_for(self.ws.recv(), timeout=5)
-            msg = json.loads(raw)
-            if msg.get("id") == sub_id:
-                break
-
-        logger.info("  Session created: %s", session_key)
-        return session_key
-
-    async def send_chat(self, message: str, timeout: float = 120) -> str:
-        """Send a chat message and collect the assistant reply."""
-        async with self._lock:
-            if not self._connected or not self.ws or getattr(self.ws, "closed", False):
-                await self._do_connect()
-
-            session_key = await self._ensure_session()
-            assert self.ws is not None
-
-            req_id = str(uuid.uuid4())
-            await self.ws.send(json.dumps({
-                "type": "req",
-                "id": req_id,
-                "method": "sessions.send",
-                "params": {
-                    "key": session_key,
-                    "message": message,
-                },
-            }))
-            logger.info("📤 Sent msg_id=%s via session %s", req_id, session_key[:30])
-
-            # Collect assistant text from session events
-            assistant_texts: list[str] = []
-            deadline = time.time() + timeout
-
-            while time.time() < deadline:
+        Responses (``type == "res"``) resolve the future registered under
+        their ``id``.  Session events are routed to the queue for their
+        session key.  This is the only place that reads the socket once the
+        connection is live, which is what makes concurrent requests safe.
+        """
+        ws = self.ws
+        assert ws is not None
+        try:
+            async for raw in ws:
                 try:
-                    remaining = max(0.1, deadline - time.time())
-                    raw = await asyncio.wait_for(
-                        self.ws.recv(), timeout=min(remaining, 30)
-                    )
                     msg: dict[str, Any] = json.loads(raw)
-                except asyncio.TimeoutError:
-                    if assistant_texts:
-                        break
+                except (ValueError, TypeError):
                     continue
-                except websockets.ConnectionClosed:
-                    self._connected = False
-                    break
 
                 msg_type = msg.get("type", "")
                 msg_id = msg.get("id", "")
-                event = msg.get("event", "")
 
-                # Direct response to our send request
-                if msg_type == "res" and msg_id == req_id:
-                    if msg.get("ok") is False:
-                        err = msg.get("error", {})
-                        err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                        logger.error("  sessions.send error: %s", err_msg)
-                        raise RuntimeError(f"sessions.send failed: {err_msg}")
+                if msg_type == "res" and msg_id in self._pending:
+                    fut = self._pending.get(msg_id)
+                    if fut is not None and not fut.done():
+                        fut.set_result(msg)
                     continue
 
-                # Session events carry the AI's reply
                 if msg_type == "event":
-                    payload = msg.get("payload", msg.get("data", {}))
-                    if not isinstance(payload, dict):
-                        continue
+                    key = self._event_session_key(msg)
+                    if key and key in self._session_events:
+                        self._session_events[key].put_nowait(msg)
+                    else:
+                        # Unkeyed events get broadcast to all active sessions so
+                        # an in-flight request still observes its reply even if
+                        # the Gateway omits the session key on the frame.
+                        for q in self._session_events.values():
+                            q.put_nowait(msg)
+        except websockets.ConnectionClosed:
+            pass
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Receive loop terminated: %s", exc)
+        finally:
+            self._connected = False
+            # Fail any in-flight requests so callers don't hang.
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionError("WebSocket closed"))
 
-                    # agent stream events carry the assistant text
-                    if event == "agent":
-                        stream = payload.get("stream", "")
-                        data = payload.get("data", {})
-                        if stream == "assistant" and isinstance(data, dict):
-                            text = data.get("text", "")
-                            if text:
-                                # If replace=True, overwrite last entry
-                                if data.get("replace") and assistant_texts:
-                                    assistant_texts[-1] = text
-                                else:
-                                    assistant_texts.append(text)
-                        elif stream == "lifecycle" and isinstance(data, dict):
-                            if data.get("phase") == "end":
-                                break
+    @staticmethod
+    def _event_session_key(msg: dict[str, Any]) -> str:
+        """Best-effort extraction of the session key an event belongs to."""
+        payload = msg.get("payload", msg.get("data", {}))
+        if isinstance(payload, dict):
+            for field in ("key", "session", "sessionKey"):
+                val = payload.get(field)
+                if isinstance(val, str) and val:
+                    return val
+        for field in ("key", "session", "sessionKey"):
+            val = msg.get(field)
+            if isinstance(val, str) and val:
+                return val
+        return ""
 
-                    # chat events with final state contain the complete reply
-                    elif event == "chat":
-                        state = payload.get("state", "")
-                        chat_msg = payload.get("message", {})
-                        if isinstance(chat_msg, dict) and chat_msg.get("role") == "assistant":
-                            content = chat_msg.get("content", "")
-                            if isinstance(content, list):
-                                for item in content:
-                                    if isinstance(item, dict) and item.get("type") == "text":
-                                        assistant_texts.append(item.get("text", ""))
-                            elif isinstance(content, str) and content:
-                                assistant_texts.append(content)
-                        if state == "final":
-                            break
+    # -- request plumbing ---------------------------------------------------
 
-            # Take the last assistant text (the final reply)
-            reply = assistant_texts[-1].strip() if assistant_texts else ""
-            if not reply:
-                reply = "（ClawBot did not return a valid reply — check Gateway status and Agent config）"
-            logger.info("📥 Reply: %s…", reply[:80])
+    async def _request(self, method: str, params: dict[str, Any], timeout: float = 10) -> dict[str, Any]:
+        """Send a req frame and await its matching res frame."""
+        assert self.ws is not None
+        req_id = str(uuid.uuid4())
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending[req_id] = fut
+        try:
+            await self.ws.send(json.dumps({
+                "type": "req",
+                "id": req_id,
+                "method": method,
+                "params": params,
+            }))
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._pending.pop(req_id, None)
+
+    # -- session management -------------------------------------------------
+
+    async def _get_session(self, conversation_id: str) -> str:
+        """Return the session key for a conversation, creating it on demand.
+
+        Sessions are cached so each conversation reuses one OpenClaw session
+        (preserving the agent's shared memory across turns).
+        """
+        cached = self._sessions.get(conversation_id)
+        if cached and cached in self._session_events:
+            return cached
+
+        res = await self._request("sessions.create", {})
+        if not res.get("ok"):
+            raise ConnectionError(f"Failed to create session: {res.get('error')}")
+        session_key = res.get("payload", {}).get("key", "")
+        if not session_key:
+            raise ConnectionError("sessions.create returned no key")
+
+        # Register the event queue BEFORE subscribing so no early event is lost.
+        self._session_events.setdefault(session_key, asyncio.Queue())
+
+        sub = await self._request("sessions.subscribe", {"key": session_key})
+        if sub.get("ok") is False:
+            raise ConnectionError(f"sessions.subscribe failed: {sub.get('error')}")
+
+        self._sessions[conversation_id] = session_key
+        logger.info("  Session ready for %s: %s", conversation_id, session_key)
+        return session_key
+
+    def _conv_lock(self, conversation_id: str) -> asyncio.Lock:
+        lock = self._session_locks.get(conversation_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[conversation_id] = lock
+        return lock
+
+    # -- chat ---------------------------------------------------------------
+
+    async def send_chat(
+        self,
+        message: str,
+        conversation_id: str = "default",
+        timeout: float = 120,
+    ) -> str:
+        """Send a chat message on a conversation and collect the reply.
+
+        Turns within the same ``conversation_id`` serialise (they share an
+        OpenClaw session and must keep message ordering); different
+        conversations proceed concurrently.
+        """
+        if not self._is_open():
+            await self.connect()
+
+        async with self._conv_lock(conversation_id):
+            session_key = await self._get_session(conversation_id)
+            queue = self._session_events[session_key]
+            # Drain any stale events left from a previous turn.
+            while not queue.empty():
+                queue.get_nowait()
+
+            send_res = await self._request(
+                "sessions.send",
+                {"key": session_key, "message": message},
+                timeout=min(timeout, 30),
+            )
+            if send_res.get("ok") is False:
+                err = send_res.get("error", {})
+                err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                raise RuntimeError(f"sessions.send failed: {err_msg}")
+            logger.info("[send] session=%s", session_key[:30])
+
+            reply = await self._collect_reply(queue, timeout=timeout)
+            logger.info("[recv] reply: %s…", reply[:80])
             return reply
+
+    async def _collect_reply(self, queue: asyncio.Queue, timeout: float) -> str:
+        """Collect assistant text from a session's event stream."""
+        assistant_texts: list[str] = []
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            remaining = max(0.1, deadline - time.time())
+            try:
+                msg = await asyncio.wait_for(queue.get(), timeout=min(remaining, 30))
+            except asyncio.TimeoutError:
+                if assistant_texts:
+                    break
+                continue
+
+            if msg.get("type") != "event":
+                continue
+            event = msg.get("event", "")
+            payload = msg.get("payload", msg.get("data", {}))
+            if not isinstance(payload, dict):
+                continue
+
+            # agent stream events carry the assistant text
+            if event == "agent":
+                stream = payload.get("stream", "")
+                data = payload.get("data", {})
+                if stream == "assistant" and isinstance(data, dict):
+                    text = data.get("text", "")
+                    if text:
+                        if data.get("replace") and assistant_texts:
+                            assistant_texts[-1] = text
+                        else:
+                            assistant_texts.append(text)
+                elif stream == "lifecycle" and isinstance(data, dict):
+                    if data.get("phase") == "end":
+                        break
+
+            # chat events with final state contain the complete reply
+            elif event == "chat":
+                state = payload.get("state", "")
+                chat_msg = payload.get("message", {})
+                if isinstance(chat_msg, dict) and chat_msg.get("role") == "assistant":
+                    content = chat_msg.get("content", "")
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                assistant_texts.append(item.get("text", ""))
+                    elif isinstance(content, str) and content:
+                        assistant_texts.append(content)
+                if state == "final":
+                    break
+
+        reply = assistant_texts[-1].strip() if assistant_texts else ""
+        if not reply:
+            reply = "（ClawBot did not return a valid reply — check Gateway status and Agent config）"
+        return reply
 
     # -- lifecycle ----------------------------------------------------------
 
+    async def _teardown_locked(self) -> None:
+        """Reset connection state. Caller must hold ``self._conn_lock``."""
+        if self._recv_task and not self._recv_task.done():
+            self._recv_task.cancel()
+            try:
+                await self._recv_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._recv_task = None
+        if self.ws is not None:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+        self.ws = None
+        self._connected = False
+        self._pending.clear()
+        self._session_events.clear()
+        self._sessions.clear()
+
     async def close(self) -> None:
         """Gracefully close the WebSocket connection."""
-        if self.ws:
-            await self.ws.close()
-        self._connected = False
+        async with self._conn_lock:
+            await self._teardown_locked()
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +627,7 @@ app = FastAPI(
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request) -> JSONResponse:
+async def chat_completions(payload: dict) -> JSONResponse:
     """OpenAI-compatible Chat Completions endpoint.
 
     Extracts conversation history and the latest user message, formats them
@@ -450,12 +637,17 @@ async def chat_completions(request: Request) -> JSONResponse:
     persona through its workspace files (IDENTITY.md / SOUL.md), and the
     VTuber persona_prompt is already conveyed via conversation context.
     """
-    body = await request.json()
-    messages = body.get("messages", [])
+    # Validate the request body (reject malformed input).
+    try:
+        req = ChatCompletionRequest.model_validate(payload)
+    except ValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"message": exc.errors(), "type": "invalid_request"}},
+        )
 
     conversation_history = [
-        msg for msg in messages
-        if msg.get("role") in ("user", "assistant")
+        msg for msg in req.messages if msg.role in ("user", "assistant")
     ]
 
     # Truncate to last 10 messages to avoid token overflow
@@ -464,8 +656,8 @@ async def chat_completions(request: Request) -> JSONResponse:
 
     user_msg = ""
     for msg in reversed(conversation_history):
-        if msg.get("role") == "user":
-            user_msg = msg.get("content", "")
+        if msg.role == "user":
+            user_msg = msg.content
             break
 
     if not user_msg:
@@ -479,13 +671,17 @@ async def chat_completions(request: Request) -> JSONResponse:
     if len(conversation_history) > 1:
         full_message += "[对话历史]\n"
         for msg in conversation_history[:-1]:
-            role_label = "用户" if msg.get("role") == "user" else "派蒙"
-            full_message += f"{role_label}：{msg.get('content', '')}\n"
+            role_label = "用户" if msg.role == "user" else "派蒙"
+            full_message += f"{role_label}：{msg.content}\n"
         full_message += "\n"
     full_message += f"[当前输入]\n用户：{user_msg}"
 
+    # ``user`` doubles as the conversation key so a conversation reuses one
+    # OpenClaw session (shared memory). Fall back to a single shared session.
+    conversation_id = req.user or "default"
+
     try:
-        reply = await bridge.send_chat(full_message)
+        reply = await bridge.send_chat(full_message, conversation_id=conversation_id)
     except Exception as exc:
         logger.error("Communication error: %s", exc)
         return JSONResponse(
@@ -539,7 +735,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=5001, help="Bind port")
     args = parser.parse_args()
 
-    logger.info("🦞 ClawBot Bridge starting…")
+    logger.info("ClawBot Bridge starting…")
     logger.info("   OpenClaw: %s", OPENCLAW_WS_URL)
     logger.info("   API: http://%s:%d/v1/chat/completions", args.host, args.port)
     uvicorn.run(app, host=args.host, port=args.port)

@@ -1,0 +1,29 @@
+[project]
+name = "ai-paimon"
+version = "2.0.0"
+description = "AI Paimon — VITS TTS server + OpenClaw→OpenAI bridge for Open-LLM-VTuber"
+requires-python = ">=3.10"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 110
+# Upstream VITS is vendored third-party code (MIT, jaywalnut310) — lint only
+# our own code, not the vendored model.
+extend-exclude = ["src/vits_server/VITS"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = [
+    "E501",  # line length handled by formatter, not enforced hard
+    "B008",  # FastAPI uses callables in argument defaults (Depends etc.)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Bridge intentionally touches the private ``bridge._connected`` flag in its
+# own health endpoint; tests touch private attrs to assert internal behaviour.
+"tests/*" = ["E402"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"

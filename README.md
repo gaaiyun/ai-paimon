@@ -50,6 +50,7 @@ graph TD
     end
 
     subgraph LLM["🧠 大语言模型"]
+        BRIDGE["ClawBot Bridge<br/><i>:5001 · OpenAI 兼容</i>"]
         GATEWAY["OpenClaw Gateway<br/><i>:18789</i>"]
         CLAWBOT["ClawBot Agent<br/><i>MiniMax M2.5</i>"]
     end
@@ -69,9 +70,10 @@ graph TD
     DESKTOP -->|WebSocket| ORCH
     ORCH -->|音频| SHERPA
     SHERPA -->|文本| ORCH
-    ORCH -->|OpenAI API| GATEWAY
+    ORCH -->|OpenAI API| BRIDGE
+    BRIDGE <-->|WS v3| GATEWAY
     GATEWAY <-->|WS| CLAWBOT
-    GATEWAY -->|AI 回复| ORCH
+    BRIDGE -->|AI 回复| ORCH
     ORCH -->|文本| VITS
     VITS -->|WAV 音频| ORCH
     ORCH -->|音频+表情| BROWSER
@@ -191,13 +193,19 @@ cp -r live2d-models/paimon <your-open-llm-vtuber>/live2d-models/paimon
 # Terminal 1 — OpenClaw Gateway
 openclaw gateway
 
-# Terminal 2 — Paimon VITS TTS
+# Terminal 2 — ClawBot Bridge (OpenClaw WS → OpenAI REST, port 5001)
+python src/clawbot_bridge.py
+
+# Terminal 3 — Paimon VITS TTS (port 8020)
 python src/vits_server/server.py
 
-# Terminal 3 — Open-LLM-VTuber
+# Terminal 4 — Open-LLM-VTuber
 cd <your-open-llm-vtuber>
 uv run run_server.py
 ```
+
+> 💡 On Windows you can launch all of the above (Gateway health-check + Bridge
+> + VITS + VTuber) in one shot with `scripts\start_all.bat`.
 
 Then open **http://localhost:12393** in your browser 🎉
 
@@ -277,7 +285,7 @@ sequenceDiagram
 |---------|------|
 | [Open-LLM-VTuber](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber) | VTuber framework |
 | [OpenClaw / ClawBot](https://openclaw.com/) | LLM gateway |
-| [VITS](https://github.com/jaywalnut310/vits) | TTS architecture |
+| [VITS](https://github.com/jaywalnut310/vits) (commit `2e561ba`, MIT, © 2021 Jaehyeon Kim) | TTS architecture — vendored in `src/vits_server/VITS/` with its [LICENSE](src/vits_server/VITS/LICENSE) |
 | [DigitalLife](https://github.com/AnyaCoder/DigitalLife) | VITS integration reference |
 | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | ASR engine |
 
@@ -286,8 +294,19 @@ sequenceDiagram
 ## ⚠️ Disclaimer
 
 This project is a fan-made, non-commercial creation. *Genshin Impact* and
-*Paimon* are trademarks of miHoYo / HoYoverse. The VITS model checkpoint
-is for personal, non-commercial use only.
+*Paimon* are trademarks of miHoYo / HoYoverse.
+
+The Live2D assets under `live2d-models/paimon/` (`*.moc3`, `*.physics3.json`,
+`*.motion3.json`, `*.pkf`, textures) are resources **extracted from the
+Genshin Impact game** and remain the property of miHoYo / HoYoverse. They are
+included here **for personal, non-commercial use only — please do not
+redistribute them**. Likewise, the VITS voice checkpoint (`paimon.pth`) is for
+personal, non-commercial use only. If you are the rights holder and want these
+assets removed, please open an issue.
+
+The VITS model architecture under `src/vits_server/VITS/` is third-party code
+by Jaehyeon Kim, used under the MIT License (see
+[its LICENSE](src/vits_server/VITS/LICENSE)).
 
 ---
 

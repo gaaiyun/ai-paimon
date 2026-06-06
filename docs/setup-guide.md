@@ -42,6 +42,8 @@
         ↓ WebSocket
    SenseVoice ASR（本地 CPU，语音识别）
         ↓
+   ClawBot Bridge :5001（本仓库，OpenAI 兼容 → OpenClaw WS v3）
+        ↓
    OpenClaw Gateway :18789（本地 → 调用你配置好的大模型）
         ↓
    Paimon VITS TTS :8020（本地 CPU/GPU，合成派蒙音色）
@@ -225,15 +227,18 @@ Copy-Item "config\conf.yaml.example" "<OLV_DIR>\conf.yaml"
 
 ```yaml
       openai_compatible_llm:
-        base_url: 'http://127.0.0.1:18789/v1'       # OpenClaw Gateway，不需要修改
-        llm_api_key: 'YOUR_OPENCLAW_GATEWAY_TOKEN'   # ← 替换为第五步获取的 token
+        base_url: 'http://127.0.0.1:5001/v1'        # ClawBot Bridge（本仓库），不需要修改
+        llm_api_key: 'not-needed'                    # 桥接器不校验此值，保持非空即可
         organization_id: null
         project_id: null
-        model: 'openclaw:main'                        # 固定值，不需要修改
+        model: 'clawbot'                              # 固定值，不需要修改
         temperature: 0.7
 ```
 
-将 `YOUR_OPENCLAW_GATEWAY_TOKEN` 替换为你在 `~/.openclaw/openclaw.json` 中找到的 `token` 值。
+> Open-LLM-VTuber 通过本仓库的 **ClawBot Bridge**（`:5001`，OpenAI 兼容）接入 OpenClaw，
+> 而不是直连 Gateway 的 `:18789`。真正的 OpenClaw 凭据（token / 设备密钥）配置在 `.env` 里，
+> 由桥接器读取，因此这里的 `llm_api_key` 只需保持非空。启动桥接：`python src/clawbot_bridge.py`
+> 或运行 `scripts\start_all.bat` 一键拉起。
 
 ### 6.3 确认 VITS TTS 配置（通常不需要修改）
 
@@ -260,15 +265,15 @@ character_config:
 
 ## 第七步：启动全部服务
 
-必须按照以下顺序依次启动三个服务：
+必须按照以下顺序依次启动四个服务：
 
 ```
-1. openclaw gateway   →   2. Paimon VITS TTS   →   3. Open-LLM-VTuber
+1. openclaw gateway   →   2. ClawBot Bridge (:5001)   →   3. Paimon VITS TTS (:8020)   →   4. Open-LLM-VTuber
 ```
 
 ### 方式一：一键启动（Windows 推荐）
 
-编辑 `scripts\start_all.bat`，将其中的路径替换为你实际的路径，然后双击运行即可。
+编辑 `scripts\start_all.bat`，将其中的路径替换为你实际的路径，然后双击运行即可。该脚本会先健康检查 Gateway，再依次拉起 ClawBot Bridge、VITS 与 Open-LLM-VTuber。
 
 ### 方式二：手动分终端启动
 
@@ -277,13 +282,19 @@ character_config:
 openclaw gateway
 ```
 
-**终端 2** — 启动 Paimon VITS 语音服务：
+**终端 2** — 启动 ClawBot Bridge（OpenClaw WS → OpenAI REST）：
+```powershell
+cd ai-paimon
+python src/clawbot_bridge.py
+```
+
+**终端 3** — 启动 Paimon VITS 语音服务：
 ```powershell
 cd ai-paimon
 python src/vits_server/server.py
 ```
 
-**终端 3** — 启动 Open-LLM-VTuber 主服务：
+**终端 4** — 启动 Open-LLM-VTuber 主服务：
 ```powershell
 cd <OLV_DIR>
 uv run run_server.py
@@ -291,7 +302,7 @@ uv run run_server.py
 
 ### 访问界面
 
-三个服务全部启动后，打开浏览器访问：
+四个服务全部启动后，打开浏览器访问：
 
 **http://localhost:12393**
 

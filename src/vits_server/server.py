@@ -4,6 +4,10 @@ Paimon VITS Text-to-Speech Server
 Loads a pre-trained VITS checkpoint (``paimon.pth``) and exposes a
 FastAPI endpoint compatible with Open-LLM-VTuber's ``x_tts`` backend.
 
+The 417 MB model is loaded inside the FastAPI ``lifespan`` (not at import
+time) so the module can be imported — and unit-tested — without the weights
+present.
+
 Configuration
 -------------
 Set ``VITS_MODEL_PATH`` and ``VITS_CONFIG_PATH`` environment variables,
@@ -23,12 +27,15 @@ import json
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 
 import soundfile as sf
 import torch
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, Field, ValidationError
 
 # ---------------------------------------------------------------------------
 # Logging — ensure UTF-8 on Windows console
@@ -74,12 +81,25 @@ MODEL_PATH: str = os.getenv("VITS_MODEL_PATH", _DEFAULT_MODEL)
 
 
 # ---------------------------------------------------------------------------
-# Detect symbols from config file (if present) and override module-level
+# Request model (reject malformed input)
+# ---------------------------------------------------------------------------
+
+class TTSRequest(BaseModel):
+    """Open-LLM-VTuber ``x_tts`` synthesis request."""
+
+    text: str = Field(..., min_length=1)
+    length_scale: float = Field(default=1.0, gt=0)
+
+    model_config = {"extra": "ignore"}
+
+
+# ---------------------------------------------------------------------------
+# Detect symbols from config file (if present)
 # ---------------------------------------------------------------------------
 def _load_config_symbols(config_path: str) -> list[str] | None:
     """Read symbols list from a VITS JSON config, if the 'symbols' key exists."""
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             cfg = json.load(f)
         if "symbols" in cfg:
             return cfg["symbols"]
@@ -88,18 +108,23 @@ def _load_config_symbols(config_path: str) -> list[str] | None:
     return None
 
 
-config_symbols = _load_config_symbols(CONFIG_PATH)
-if config_symbols is not None:
-    # Monkey-patch the symbols list and rebuild the text module mappings
-    import VITS.text as _text_mod
-    _text_mod.symbols = config_symbols
-    _text_mod._symbol_to_id = {s: i for i, s in enumerate(config_symbols)}
-    _text_mod._id_to_symbol = {i: s for i, s in enumerate(config_symbols)}
-    n_symbols = len(config_symbols)
-    logger.info("  Symbols: %d (from config)", n_symbols)
-else:
-    n_symbols = len(symbols)
-    logger.info("  Symbols: %d (from symbols.py)", n_symbols)
+def _resolve_symbol_count(config_path: str) -> int:
+    """Resolve the symbol vocabulary size, honouring a config override.
+
+    If the config carries its own ``symbols`` list, monkey-patch the text
+    module's mappings so ``text_to_sequence`` uses the matching vocabulary.
+    Returns the symbol count the model must be built with.
+    """
+    config_symbols = _load_config_symbols(config_path)
+    if config_symbols is not None:
+        import VITS.text as _text_mod
+        _text_mod.symbols = config_symbols
+        _text_mod._symbol_to_id = {s: i for i, s in enumerate(config_symbols)}
+        _text_mod._id_to_symbol = {i: s for i, s in enumerate(config_symbols)}
+        logger.info("  Symbols: %d (from config)", len(config_symbols))
+        return len(config_symbols)
+    logger.info("  Symbols: %d (from symbols.py)", len(symbols))
+    return len(symbols)
 
 
 # ---------------------------------------------------------------------------
@@ -115,51 +140,77 @@ def _get_text(text: str, hps) -> torch.LongTensor:
 
 
 # ---------------------------------------------------------------------------
-# Model initialisation
+# Model initialisation (called from lifespan, NOT at import time)
 # ---------------------------------------------------------------------------
 
-logger.info("Loading VITS model…")
-logger.info("  Config : %s", CONFIG_PATH)
-logger.info("  Weights: %s", MODEL_PATH)
+def load_model(config_path: str, model_path: str) -> dict:
+    """Load hparams + VITS checkpoint. Returns a state dict for the app.
 
-hps = utils.get_hparams_from_file(CONFIG_PATH)
+    Heavy work (parsing config, building the network, loading the ~417 MB
+    checkpoint) lives here so importing this module stays cheap and testable.
+    """
+    logger.info("Loading VITS model…")
+    logger.info("  Config : %s", config_path)
+    logger.info("  Weights: %s", model_path)
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-logger.info("  Device : %s", device)
+    n_symbols = _resolve_symbol_count(config_path)
+    hps = utils.get_hparams_from_file(config_path)
 
-net_g = SynthesizerTrn(
-    n_symbols,
-    hps.data.filter_length // 2 + 1,
-    hps.train.segment_size // hps.data.hop_length,
-    **hps.model,
-).to(device)
-net_g.eval()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info("  Device : %s", device)
 
-utils.load_checkpoint(MODEL_PATH, net_g, None)
-logger.info("✅ VITS model loaded successfully!")
+    net_g = SynthesizerTrn(
+        n_symbols,
+        hps.data.filter_length // 2 + 1,
+        hps.train.segment_size // hps.data.hop_length,
+        **hps.model,
+    ).to(device)
+    net_g.eval()
+
+    utils.load_checkpoint(model_path, net_g, None)
+    logger.info("[OK] VITS model loaded successfully!")
+    return {"hps": hps, "net_g": net_g, "device": device}
+
 
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load the model on startup and stash it on ``app.state``."""
+    state = load_model(CONFIG_PATH, MODEL_PATH)
+    app.state.hps = state["hps"]
+    app.state.net_g = state["net_g"]
+    app.state.device = state["device"]
+    yield
+
+
 app = FastAPI(
     title="Paimon VITS TTS",
     description="VITS speech synthesis server for Paimon voice",
+    lifespan=lifespan,
 )
 
 
 @app.post("/tts_to_audio")
-async def tts_to_audio(request: Request) -> Response:
+async def tts_to_audio(payload: dict) -> Response:
     """Synthesise speech from text (Open-LLM-VTuber ``x_tts`` compatible)."""
-    data = await request.json()
-    text: str = data.get("text", "")
-    if not text:
-        return Response(status_code=400, content="Empty text")
+    try:
+        req = TTSRequest.model_validate(payload)
+    except ValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"message": exc.errors(), "type": "invalid_request"}},
+        )
 
-    logger.info("TTS request: %s", text)
+    logger.info("TTS request: %s", req.text)
 
-    length_scale = float(data.get("length_scale", 1.0))
-    stn_tst = _get_text(text, hps)
+    hps = app.state.hps
+    net_g = app.state.net_g
+    device = app.state.device
+
+    stn_tst = _get_text(req.text, hps)
 
     with torch.no_grad():
         x_tst = stn_tst.to(device).unsqueeze(0)
@@ -170,7 +221,7 @@ async def tts_to_audio(request: Request) -> Response:
                 x_tst_lengths,
                 noise_scale=0.667,
                 noise_scale_w=0.8,
-                length_scale=length_scale,
+                length_scale=req.length_scale,
             )[0][0, 0]
             .data.cpu()
             .float()
@@ -186,7 +237,9 @@ async def tts_to_audio(request: Request) -> Response:
 @app.get("/health")
 async def health() -> dict:
     """Health check."""
-    return {"status": "ok", "device": device, "model": os.path.basename(MODEL_PATH)}
+    loaded = getattr(app.state, "net_g", None) is not None
+    device = getattr(app.state, "device", "unknown")
+    return {"status": "ok", "device": device, "model": os.path.basename(MODEL_PATH), "loaded": loaded}
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +252,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=int(os.getenv("VITS_PORT", "8020")))
     args = parser.parse_args()
 
-    logger.info("🎙️ Starting Paimon VITS server on http://%s:%d", args.host, args.port)
+    logger.info("Starting Paimon VITS server on http://%s:%d", args.host, args.port)
     uvicorn.run(app, host=args.host, port=args.port)
 
 
